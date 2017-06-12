@@ -17,18 +17,22 @@ import com.google.common.collect.ImmutableList;
 import com.spotify.reaper.core.RepairSegment.State;
 import com.spotify.reaper.storage.postgresql.LongCollectionSQLType;
 
+import java.util.List;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
 import org.apache.cassandra.repair.RepairParallelism;
 import org.joda.time.DateTime;
 
 public class RepairSchedule {
 
-  private final long id;
+  private final UUID id;
 
-  private final long repairUnitId;
+  private final UUID repairUnitId;
   private final State state;
   private final int daysBetween;
   private final DateTime nextActivation;
-  private final ImmutableList<Long> runHistory;
+  private final ImmutableList<UUID> runHistory;
   private final int segmentCount;
   private final RepairParallelism repairParallelism;
   private final double intensity;
@@ -36,7 +40,7 @@ public class RepairSchedule {
   private final String owner;
   private final DateTime pauseTime;
 
-  private RepairSchedule(Builder builder, long id) {
+  private RepairSchedule(Builder builder, UUID id) {
     this.id = id;
     this.repairUnitId = builder.repairUnitId;
     this.state = builder.state;
@@ -51,11 +55,11 @@ public class RepairSchedule {
     this.pauseTime = builder.pauseTime;
   }
 
-  public long getId() {
+  public UUID getId() {
     return id;
   }
 
-  public long getRepairUnitId() {
+  public UUID getRepairUnitId() {
     return repairUnitId;
   }
 
@@ -75,7 +79,7 @@ public class RepairSchedule {
     return nextActivation;
   }
 
-  public ImmutableList<Long> getRunHistory() {
+  public ImmutableList<UUID> getRunHistory() {
     return runHistory;
   }
 
@@ -84,7 +88,11 @@ public class RepairSchedule {
    * Generic collection type would be hard to map into Postgres array types.
    */
   public LongCollectionSQLType getRunHistorySQL() {
-    return new LongCollectionSQLType(runHistory);
+    List<Long> list = runHistory
+      .stream()
+      .map(UUID::getMostSignificantBits)
+      .collect(Collectors.toList());
+    return new LongCollectionSQLType(list);
   }
 
   public int getSegmentCount() {
@@ -123,11 +131,11 @@ public class RepairSchedule {
 
   public static class Builder {
 
-    public final long repairUnitId;
+    public final UUID repairUnitId;
     private State state;
     private int daysBetween;
     private DateTime nextActivation;
-    private ImmutableList<Long> runHistory;
+    private ImmutableList<UUID> runHistory;
     private int segmentCount;
     private RepairParallelism repairParallelism;
     private double intensity;
@@ -135,8 +143,8 @@ public class RepairSchedule {
     private String owner;
     private DateTime pauseTime;
 
-    public Builder(long repairUnitId, State state, int daysBetween, DateTime nextActivation,
-                   ImmutableList<Long> runHistory, int segmentCount,
+    public Builder(UUID repairUnitId, State state, int daysBetween, DateTime nextActivation,
+                   ImmutableList<UUID> runHistory, int segmentCount,
                    RepairParallelism repairParallelism,
                    double intensity, DateTime creationTime) {
       this.repairUnitId = repairUnitId;
@@ -181,7 +189,7 @@ public class RepairSchedule {
       return this;
     }
 
-    public Builder runHistory(ImmutableList<Long> runHistory) {
+    public Builder runHistory(ImmutableList<UUID> runHistory) {
       this.runHistory = runHistory;
       return this;
     }
@@ -216,7 +224,7 @@ public class RepairSchedule {
       return this;
     }
 
-    public RepairSchedule build(long id) {
+    public RepairSchedule build(UUID id) {
       return new RepairSchedule(this, id);
     }
   }
