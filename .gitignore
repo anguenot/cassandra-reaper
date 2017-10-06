@@ -8,18 +8,27 @@ dependency-reduced-pom.xml
 *.iml
 *~
 .idea/*
+*.log
+*.log.gz
 
 # Mac OS X Finder
 .DS_Store
 
 .classpath
-bin/
 .settings/
 .project
-build/
+/src/server/build/
+src/packaging/build/
 *.deb
+*.rpm
 
-# frontend dev stuffs.
-reaper_ui/bower_components/
-reaper_ui/node_modules/
+# frontend dev stuff
+src/ui/bower_components
+src/ui/node_modules
+src/ui/package-lock.json
 
+# Docker Compose persistent storage directory
+src/packaging/data
+
+# SSL stores directory
+src/packaging/ssl-stores
