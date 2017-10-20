@@ -288,15 +288,14 @@ public final class ReaperApplication extends Application<ReaperApplicationConfig
       flyway.setLocations("/db/postgres");
     }
     flyway.setBaselineOnMigrate(true);
+    flyway.repair();
     flyway.migrate();
   }
 
   private void initializeJmxSeedsForAllClusters() {
     LOG.info("Initializing JMX seed list for all clusters...");
-    try (JmxConnectionsInitializer jmxConnectionsIntializer =
-            new JmxConnectionsInitializer(context);
-        Timer.Context cxt =
-            context
+    try (JmxConnectionsInitializer jmxConnectionsIntializer = JmxConnectionsInitializer.create(context);
+        Timer.Context cxt = context
                 .metricRegistry
                 .timer(MetricRegistry.name(JmxConnectionFactory.class, "jmxConnectionsIntializer"))
                 .time()) {

@@ -57,7 +57,8 @@ import javax.ws.rs.core.Response;
 import javax.ws.rs.core.UriInfo;
 
 import com.google.common.base.Optional;
-import jersey.repackaged.com.google.common.collect.Lists;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -131,6 +132,28 @@ public final class ClusterResource {
         return Response.ok().entity(view).build();
       }
     }
+  }
+
+  @GET
+  @Path("/{cluster_name}/tables")
+  public Response getClusterTables(@PathParam("cluster_name") String clusterName)
+      throws ReaperException {
+    Map<String, List<String>> tablesByKeyspace = Maps.newHashMap();
+
+    Optional<Cluster> cluster = context.storage.getCluster(clusterName);
+    if (cluster.isPresent()) {
+      try (JmxProxy jmxProxy =
+          context.jmxConnectionFactory.connectAny(
+              cluster.get(), context.config.getJmxConnectionTimeoutInSeconds())) {
+        tablesByKeyspace = jmxProxy.listTablesByKeyspace();
+        jmxProxy.close();
+      } catch (RuntimeException e) {
+        LOG.error("Couldn't retrieve the list of tables for cluster {}", clusterName, e);
+        return Response.status(400).entity(e).build();
+      }
+    }
+
+    return Response.ok().entity(tablesByKeyspace).build();
   }
 
   @POST
@@ -334,8 +357,7 @@ public final class ClusterResource {
 
       } catch (RuntimeException e) {
         LOG.debug("failed to create cluster with seed hosts: {}", seeds, e);
-        Thread.sleep(
-            TimeUnit.MILLISECONDS.convert(JmxProxy.JMX_CONNECTION_TIMEOUT, JmxProxy.JMX_CONNECTION_TIMEOUT_UNIT));
+        Thread.sleep((int) JmxProxy.DEFAULT_JMX_CONNECTION_TIMEOUT.getSeconds() * 1000);
         return Optional.absent();
       }
     };
@@ -360,17 +382,17 @@ public final class ClusterResource {
 
       try {
         nodesStatus = CLUSTER_STATUS_EXECUTOR.invokeAny(
-            endpointStateTasks, JmxProxy.JMX_CONNECTION_TIMEOUT, JmxProxy.JMX_CONNECTION_TIMEOUT_UNIT);
+            endpointStateTasks,
+            (int) JmxProxy.DEFAULT_JMX_CONNECTION_TIMEOUT.getSeconds(),
+            TimeUnit.SECONDS);
 
       } catch (InterruptedException | ExecutionException | TimeoutException e) {
         LOG.debug("failed grabbing nodes status", e);
       }
-
       if (nodesStatus.isPresent()) {
         return nodesStatus;
       }
     }
-
     return nodesStatus;
   }
 }

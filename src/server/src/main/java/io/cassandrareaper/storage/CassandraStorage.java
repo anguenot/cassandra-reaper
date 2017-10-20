@@ -35,7 +35,6 @@ import io.cassandrareaper.storage.cassandra.Migration003;
 import java.math.BigInteger;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.Date;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -45,6 +44,7 @@ import java.util.stream.Collectors;
 import com.datastax.driver.core.BatchStatement;
 import com.datastax.driver.core.CodecRegistry;
 import com.datastax.driver.core.ConsistencyLevel;
+import com.datastax.driver.core.PoolingOptions;
 import com.datastax.driver.core.PreparedStatement;
 import com.datastax.driver.core.QueryLogger;
 import com.datastax.driver.core.QueryOptions;
@@ -66,6 +66,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.Futures;
 import io.dropwizard.setup.Environment;
+import io.dropwizard.util.Duration;
 import org.apache.cassandra.repair.RepairParallelism;
 import org.cognitor.cassandra.migration.Database;
 import org.cognitor.cassandra.migration.MigrationRepository;
@@ -74,6 +75,7 @@ import org.joda.time.DateTime;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import systems.composable.dropwizard.cassandra.CassandraFactory;
+import systems.composable.dropwizard.cassandra.pooling.PoolingOptionsFactory;
 import systems.composable.dropwizard.cassandra.retry.RetryPolicyFactory;
 
 public final class CassandraStorage implements IStorage, IDistributedStorage {
@@ -82,6 +84,7 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
   private static final String SELECT_CLUSTER = "SELECT * FROM cluster";
   private static final String SELECT_REPAIR_SCHEDULE = "SELECT * FROM repair_schedule_v1";
   private static final String SELECT_REPAIR_UNIT = "SELECT * FROM repair_unit_v1";
+  private static final String SELECT_LEADERS = "SELECT * FROM leader";
 
   private static final Logger LOG = LoggerFactory.getLogger(CassandraStorage.class);
 
@@ -105,6 +108,9 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
   private PreparedStatement insertRepairUnitPrepStmt;
   private PreparedStatement getRepairUnitPrepStmt;
   private PreparedStatement insertRepairSegmentPrepStmt;
+  private PreparedStatement insertRepairSegmentIncrementalPrepStmt;
+  private PreparedStatement updateRepairSegmentPrepStmt;
+  private PreparedStatement insertRepairSegmentEndTimePrepStmt;
   private PreparedStatement getRepairSegmentPrepStmt;
   private PreparedStatement getRepairSegmentsByRunIdPrepStmt;
   private PreparedStatement insertRepairSchedulePrepStmt;
@@ -125,21 +131,13 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
 
   public CassandraStorage(ReaperApplicationConfiguration config, Environment environment) {
     CassandraFactory cassandraFactory = config.getCassandraFactory();
-    // all INSERT and DELETE stmt prepared in this class are idempoten
-    if (cassandraFactory.getQueryOptions().isPresent()
-        && ConsistencyLevel.LOCAL_ONE != cassandraFactory.getQueryOptions().get().getConsistencyLevel()) {
-      LOG.warn("Customization of cassandra's queryOptions is not supported and will be overridden");
-    }
-    cassandraFactory.setQueryOptions(java.util.Optional.of(new QueryOptions().setDefaultIdempotence(true)));
-    if (cassandraFactory.getRetryPolicy().isPresent()) {
-      LOG.warn("Customization of cassandra's retry policy is not supported and will be overridden");
-    }
-    cassandraFactory.setRetryPolicy(java.util.Optional.of((RetryPolicyFactory) () -> new RetryPolicyImpl()));
+    overrideQueryOptions(cassandraFactory);
+    overrideRetryPolicy(cassandraFactory);
+    overridePoolingOptions(cassandraFactory);
     cassandra = cassandraFactory.build(environment);
     if (config.getActivateQueryLogger()) {
       cassandra.register(QueryLogger.builder().build());
     }
-
     CodecRegistry codecRegistry = cassandra.getConfiguration().getCodecRegistry();
     codecRegistry.register(new DateTimeCodec());
     session = cassandra.connect(config.getCassandraFactory().getKeyspace());
@@ -185,15 +183,31 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
         = session.prepare("DELETE FROM repair_run_by_cluster WHERE id = ? and cluster_name = ?");
     deleteRepairRunByUnitPrepStmt = session.prepare("DELETE FROM repair_run_by_unit "
         + "WHERE id = ? and repair_unit_id= ?");
-    insertRepairUnitPrepStmt = session.prepare(
-        "INSERT INTO repair_unit_v1(id, cluster_name, keyspace_name, column_families, "
-            + "incremental_repair, nodes, datacenters) VALUES(?, ?, ?, ?, ?, ?, ?)");
+    insertRepairUnitPrepStmt =
+        session.prepare(
+            "INSERT INTO repair_unit_v1(id, cluster_name, keyspace_name, column_families, "
+                + "incremental_repair, nodes, datacenters, blacklisted_tables) VALUES(?, ?, ?, ?, ?, ?, ?, ?)");
     getRepairUnitPrepStmt = session.prepare("SELECT * FROM repair_unit_v1 WHERE id = ?");
     insertRepairSegmentPrepStmt = session
         .prepare(
-            "INSERT INTO repair_run(id, segment_id, repair_unit_id, start_token, end_token, segment_state, "
-                + "coordinator_host, segment_start_time, segment_end_time, fail_count)"
-                + " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            "INSERT INTO repair_run"
+                + "(id,segment_id,repair_unit_id,start_token,end_token,segment_state,fail_count)"
+                + " VALUES(?, ?, ?, ?, ?, ?, ?)")
+        .setConsistencyLevel(ConsistencyLevel.LOCAL_QUORUM);
+    insertRepairSegmentIncrementalPrepStmt = session
+        .prepare(
+            "INSERT INTO repair_run"
+                + "(id,segment_id,repair_unit_id,start_token,end_token,segment_state,coordinator_host,fail_count)"
+                + " VALUES(?, ?, ?, ?, ?, ?, ?, ?)")
+        .setConsistencyLevel(ConsistencyLevel.LOCAL_QUORUM);
+    updateRepairSegmentPrepStmt = session
+        .prepare(
+            "INSERT INTO repair_run"
+                + "(id,segment_id,segment_state,coordinator_host,segment_start_time,fail_count)"
+                + " VALUES(?, ?, ?, ?, ?, ?)")
+        .setConsistencyLevel(ConsistencyLevel.LOCAL_QUORUM);
+    insertRepairSegmentEndTimePrepStmt = session
+        .prepare("INSERT INTO repair_run(id, segment_id, segment_end_time) VALUES(?, ?, ?)")
         .setConsistencyLevel(ConsistencyLevel.LOCAL_QUORUM);
     getRepairSegmentPrepStmt = session
         .prepare(
@@ -298,6 +312,7 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
     RepairRun newRepairRun = repairRun.build(UUIDs.timeBased());
     BatchStatement repairRunBatch = new BatchStatement(BatchStatement.Type.UNLOGGED);
     List<ResultSetFuture> futures = Lists.newArrayList();
+    Boolean isIncremental = null;
 
     repairRunBatch.add(
         insertRepairRunPrepStmt.bind(
@@ -318,9 +333,18 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
 
     for (RepairSegment.Builder builder : newSegments) {
       RepairSegment segment = builder.withRunId(newRepairRun.getId()).build(UUIDs.timeBased());
+      isIncremental = null == isIncremental ? null != segment.getCoordinatorHost() : isIncremental;
 
-      repairRunBatch.add(
-          insertRepairSegmentPrepStmt.bind(
+      assert RepairSegment.State.NOT_STARTED == segment.getState();
+      assert null == segment.getStartTime();
+      assert null == segment.getEndTime();
+      assert 0 == segment.getFailCount();
+      assert (null != segment.getCoordinatorHost()) == isIncremental;
+
+      if (isIncremental) {
+
+        repairRunBatch.add(
+            insertRepairSegmentIncrementalPrepStmt.bind(
               segment.getRunId(),
               segment.getId(),
               segment.getRepairUnitId(),
@@ -328,15 +352,27 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
               segment.getEndToken(),
               segment.getState().ordinal(),
               segment.getCoordinatorHost(),
-              segment.getStartTime(),
-              segment.getEndTime(),
               segment.getFailCount()));
+      } else {
 
-      if (100 == repairRunBatch.size()) {
+        repairRunBatch.add(
+            insertRepairSegmentPrepStmt.bind(
+              segment.getRunId(),
+              segment.getId(),
+              segment.getRepairUnitId(),
+              segment.getStartToken(),
+              segment.getEndToken(),
+              segment.getState().ordinal(),
+              segment.getFailCount()));
+      }
+
+      if (100 <= repairRunBatch.size()) {
         futures.add(session.executeAsync(repairRunBatch));
         repairRunBatch = new BatchStatement(BatchStatement.Type.UNLOGGED);
       }
     }
+    assert getRepairUnit(newRepairRun.getRepairUnitId()).get().getIncrementalRepair() == isIncremental.booleanValue();
+
     futures.add(session.executeAsync(repairRunBatch));
     futures.add(
         session.executeAsync(
@@ -356,20 +392,20 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
   @Override
   public boolean updateRepairRun(RepairRun repairRun) {
     session.execute(
-        insertRepairRunPrepStmt.bind(
-            repairRun.getId(),
-            repairRun.getClusterName(),
-            repairRun.getRepairUnitId(),
-            repairRun.getCause(),
-            repairRun.getOwner(),
-            repairRun.getRunState().toString(),
-            repairRun.getCreationTime(),
-            repairRun.getStartTime(),
-            repairRun.getEndTime(),
-            repairRun.getPauseTime(),
-            repairRun.getIntensity(),
-            repairRun.getLastEvent(),
-            repairRun.getSegmentCount(),
+          insertRepairRunPrepStmt.bind(
+              repairRun.getId(),
+              repairRun.getClusterName(),
+              repairRun.getRepairUnitId(),
+              repairRun.getCause(),
+              repairRun.getOwner(),
+              repairRun.getRunState().toString(),
+              repairRun.getCreationTime(),
+              repairRun.getStartTime(),
+              repairRun.getEndTime(),
+              repairRun.getPauseTime(),
+              repairRun.getIntensity(),
+              repairRun.getLastEvent(),
+              repairRun.getSegmentCount(),
             repairRun.getRepairParallelism().toString()));
     return true;
   }
@@ -495,7 +531,8 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
             repairUnit.getColumnFamilies(),
             repairUnit.getIncrementalRepair(),
             repairUnit.getNodes(),
-            repairUnit.getDatacenters()));
+            repairUnit.getDatacenters(),
+            repairUnit.getBlacklistedTables()));
     return repairUnit;
   }
 
@@ -504,20 +541,28 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
     RepairUnit repairUnit = null;
     Row repairUnitRow = session.execute(getRepairUnitPrepStmt.bind(id)).one();
     if (repairUnitRow != null) {
-      repairUnit = new RepairUnit.Builder(
-          repairUnitRow.getString("cluster_name"),
-          repairUnitRow.getString("keyspace_name"),
-          repairUnitRow.getSet("column_families", String.class),
-          repairUnitRow.getBool("incremental_repair"),
-          repairUnitRow.getSet("nodes", String.class),
-          repairUnitRow.getSet("datacenters", String.class))
-          .build(id);
+      repairUnit =
+          new RepairUnit.Builder(
+                  repairUnitRow.getString("cluster_name"),
+                  repairUnitRow.getString("keyspace_name"),
+                  repairUnitRow.getSet("column_families", String.class),
+                  repairUnitRow.getBool("incremental_repair"),
+                  repairUnitRow.getSet("nodes", String.class),
+                  repairUnitRow.getSet("datacenters", String.class),
+                  repairUnitRow.getSet("blacklisted_tables", String.class))
+              .build(id);
     }
     return Optional.fromNullable(repairUnit);
   }
 
   @Override
-  public Optional<RepairUnit> getRepairUnit(String cluster, String keyspace, Set<String> columnFamilyNames) {
+  public Optional<RepairUnit> getRepairUnit(
+      String cluster,
+      String keyspace,
+      Set<String> columnFamilyNames,
+      Set<String> nodes,
+      Set<String> datacenters,
+      Set<String> blacklistedTables) {
     // brute force again
     RepairUnit repairUnit = null;
     Statement stmt = new SimpleStatement(SELECT_REPAIR_UNIT);
@@ -526,15 +571,20 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
     for (Row repairUnitRow : results) {
       if (repairUnitRow.getString("cluster_name").equals(cluster)
           && repairUnitRow.getString("keyspace_name").equals(keyspace)
-          && repairUnitRow.getSet("column_families", String.class).equals(columnFamilyNames)) {
-        repairUnit = new RepairUnit.Builder(
-            repairUnitRow.getString("cluster_name"),
-            repairUnitRow.getString("keyspace_name"),
-            repairUnitRow.getSet("column_families", String.class),
-            repairUnitRow.getBool("incremental_repair"),
-            repairUnitRow.getSet("nodes", String.class),
-            repairUnitRow.getSet("datacenters", String.class))
-            .build(repairUnitRow.getUUID("id"));
+          && repairUnitRow.getSet("column_families", String.class).equals(columnFamilyNames)
+          && repairUnitRow.getSet("nodes", String.class).equals(nodes)
+          && repairUnitRow.getSet("datacenters", String.class).equals(datacenters)
+          && repairUnitRow.getSet("blacklisted_tables", String.class).equals(blacklistedTables)) {
+        repairUnit =
+            new RepairUnit.Builder(
+                    repairUnitRow.getString("cluster_name"),
+                    repairUnitRow.getString("keyspace_name"),
+                    repairUnitRow.getSet("column_families", String.class),
+                    repairUnitRow.getBool("incremental_repair"),
+                    repairUnitRow.getSet("nodes", String.class),
+                    repairUnitRow.getSet("datacenters", String.class),
+                    repairUnitRow.getSet("blacklisted_tables", String.class))
+                .build(repairUnitRow.getUUID("id"));
         // exit the loop once we find a match
         break;
       }
@@ -551,23 +601,27 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
           && getRepairUnit(segment.getRepairUnitId()).get().getIncrementalRepair())
         : "non-leader trying to update repair segment " + segment.getId() + " of run " + segment.getRunId();
 
-    Date startTime = null;
-    if (segment.getStartTime() != null) {
-      startTime = segment.getStartTime().toDate();
-    }
-    session.execute(
-        insertRepairSegmentPrepStmt.bind(
+    BatchStatement updateRepairSegmentBatch = new BatchStatement(BatchStatement.Type.UNLOGGED);
+
+    updateRepairSegmentBatch.add(
+        updateRepairSegmentPrepStmt.bind(
             segment.getRunId(),
             segment.getId(),
-            segment.getRepairUnitId(),
-            segment.getStartToken(),
-            segment.getEndToken(),
             segment.getState().ordinal(),
             segment.getCoordinatorHost(),
-            startTime,
-            segment.getEndTime().toDate(),
+            null != segment.getStartTime() ? segment.getStartTime().toDate() : null,
             segment.getFailCount()));
 
+    if (null != segment.getEndTime()) {
+      assert RepairSegment.State.DONE == segment.getState();
+
+      updateRepairSegmentBatch.add(
+          insertRepairSegmentEndTimePrepStmt.bind(
+              segment.getRunId(),
+              segment.getId(),
+              segment.getEndTime().toDate()));
+    }
+    session.execute(updateRepairSegmentBatch);
     return true;
   }
 
@@ -623,18 +677,26 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
   }
 
   private static RepairSegment createRepairSegmentFromRow(Row segmentRow) {
-    return new RepairSegment.Builder(
-        new RingRange(
-            new BigInteger(segmentRow.getVarint("start_token") + ""),
-            new BigInteger(segmentRow.getVarint("end_token") + "")),
-        segmentRow.getUUID("repair_unit_id"))
+
+    RepairSegment.Builder builder = RepairSegment.builder(
+          new RingRange(
+              new BigInteger(segmentRow.getVarint("start_token") + ""),
+              new BigInteger(segmentRow.getVarint("end_token") + "")),
+          segmentRow.getUUID("repair_unit_id"))
         .withRunId(segmentRow.getUUID("id"))
-        .coordinatorHost(segmentRow.getString("coordinator_host"))
-        .endTime(new DateTime(segmentRow.getTimestamp("segment_end_time")))
-        .failCount(segmentRow.getInt("fail_count"))
-        .startTime(new DateTime(segmentRow.getTimestamp("segment_start_time")))
         .state(State.values()[segmentRow.getInt("segment_state")])
-        .build(segmentRow.getUUID("segment_id"));
+        .failCount(segmentRow.getInt("fail_count"));
+
+    if (null != segmentRow.getString("coordinator_host")) {
+      builder = builder.coordinatorHost(segmentRow.getString("coordinator_host"));
+    }
+    if (null != segmentRow.getTimestamp("segment_start_time")) {
+      builder = builder.startTime(new DateTime(segmentRow.getTimestamp("segment_start_time")));
+    }
+    if (null != segmentRow.getTimestamp("segment_end_time")) {
+      builder = builder.endTime(new DateTime(segmentRow.getTimestamp("segment_end_time")));
+    }
+    return builder.build(segmentRow.getUUID("segment_id"));
   }
 
   @Override
@@ -952,6 +1014,17 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
   }
 
   @Override
+  public List<UUID> getLeaders() {
+    Statement stmt = new SimpleStatement(SELECT_LEADERS);
+    ResultSet result = session.execute(stmt);
+    return result
+        .all()
+        .stream()
+        .map(leader -> leader.getUUID("leader_id"))
+        .collect(Collectors.toList());
+  }
+
+  @Override
   public void releaseLead(UUID leaderId) {
     ResultSet lwtResult = session.execute(releaseLeadPrepStmt.bind(leaderId, AppContext.REAPER_INSTANCE_ID));
 
@@ -1022,6 +1095,43 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
     }
   }
 
+
+  private static void overrideQueryOptions(CassandraFactory cassandraFactory) {
+    // all INSERT and DELETE stmt prepared in this class are idempoten
+    if (cassandraFactory.getQueryOptions().isPresent()
+        && ConsistencyLevel.LOCAL_ONE != cassandraFactory.getQueryOptions().get().getConsistencyLevel()) {
+      LOG.warn("Customization of cassandra's queryOptions is not supported and will be overridden");
+    }
+    cassandraFactory.setQueryOptions(java.util.Optional.of(new QueryOptions().setDefaultIdempotence(true)));
+  }
+
+  private static void overrideRetryPolicy(CassandraFactory cassandraFactory) {
+    if (cassandraFactory.getRetryPolicy().isPresent()) {
+      LOG.warn("Customization of cassandra's retry policy is not supported and will be overridden");
+    }
+    cassandraFactory.setRetryPolicy(java.util.Optional.of((RetryPolicyFactory) () -> new RetryPolicyImpl()));
+  }
+
+  private static void overridePoolingOptions(CassandraFactory cassandraFactory) {
+    PoolingOptionsFactory newPoolingOptionsFactory = new PoolingOptionsFactory() {
+      @Override
+      public PoolingOptions build() {
+        if (null == getPoolTimeout()) {
+          setPoolTimeout(Duration.minutes(2));
+        }
+        return super.build().setMaxQueueSize(40960);
+      }
+    };
+    cassandraFactory.getPoolingOptions().ifPresent((originalPoolingOptions) -> {
+      newPoolingOptionsFactory.setHeartbeatInterval(originalPoolingOptions.getHeartbeatInterval());
+      newPoolingOptionsFactory.setIdleTimeout(originalPoolingOptions.getIdleTimeout());
+      newPoolingOptionsFactory.setLocal(originalPoolingOptions.getLocal());
+      newPoolingOptionsFactory.setRemote(originalPoolingOptions.getRemote());
+      newPoolingOptionsFactory.setPoolTimeout(originalPoolingOptions.getPoolTimeout());
+    });
+    cassandraFactory.setPoolingOptions(java.util.Optional.of(newPoolingOptionsFactory));
+  }
+
   private static boolean withinRange(RepairSegment segment, Optional<RingRange> range) {
     return !range.isPresent() || segmentIsWithinRange(segment, range.get());
   }
@@ -1055,7 +1165,7 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
           Thread.sleep(100);
         } catch (InterruptedException expected) { }
       }
-      return stmt.isIdempotent()
+      return null != stmt && stmt.isIdempotent()
           ? retry < 10 ? RetryDecision.retry(cl) : RetryDecision.rethrow()
           : DefaultRetryPolicy.INSTANCE.onReadTimeout(stmt, cl, required, received, retrieved, retry);
     }
@@ -1069,7 +1179,7 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
         int received,
         int retry) {
 
-      return stmt.isIdempotent()
+      return null != stmt && stmt.isIdempotent()
           ? RetryDecision.retry(cl)
           : DefaultRetryPolicy.INSTANCE.onWriteTimeout(stmt, cl, type, required, received, retry);
     }
