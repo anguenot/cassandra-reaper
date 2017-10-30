@@ -12,16 +12,19 @@
  * limitations under the License.
  */
 
-package io.cassandrareaper.acceptance;
+package io.cassandrareaper.core;
 
-import cucumber.api.CucumberOptions;
-import cucumber.api.junit.Cucumber;
-import org.junit.runner.RunWith;
+import io.cassandrareaper.core.Cluster;
 
-@RunWith(Cucumber.class)
-@CucumberOptions(
-    features = "classpath:io.cassandrareaper.acceptance/basic_reaper_functionality.feature"
-    )
-public final class AddClusterTest {
-  // Required only to get the Cucumber acceptance tests actually run.
+import org.junit.Test;
+
+import static org.junit.Assert.assertEquals;
+
+public final class ClusterTest {
+
+  @Test
+  public void testGetSymbolicName() {
+    assertEquals("example2cluster", Cluster.toSymbolicName("Example2 Cluster"));
+    assertEquals("example2_cluster", Cluster.toSymbolicName("Example2_Cluster"));
+  }
 }

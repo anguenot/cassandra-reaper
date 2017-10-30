@@ -12,7 +12,7 @@
  * limitations under the License.
  */
 
-package io.cassandrareaper.unit.resources;
+package io.cassandrareaper.resources;
 
 import io.cassandrareaper.AppContext;
 import io.cassandrareaper.ReaperException;
@@ -20,13 +20,13 @@ import io.cassandrareaper.core.Cluster;
 import io.cassandrareaper.jmx.JmxConnectionFactory;
 import io.cassandrareaper.jmx.JmxProxy;
 import io.cassandrareaper.jmx.RepairStatusHandler;
-import io.cassandrareaper.resources.ClusterResource;
+import io.cassandrareaper.service.TestRepairConfiguration;
 import io.cassandrareaper.storage.MemoryStorage;
-import io.cassandrareaper.unit.service.TestRepairConfiguration;
 
 import java.net.URI;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.Set;
 
 import javax.ws.rs.core.Response;
 import javax.ws.rs.core.UriInfo;
@@ -164,6 +164,15 @@ public final class ClusterResourceTest {
         mocks.context.storage.getRepairSchedulesForClusterAndKeyspace(
             CLUSTER_NAME, "keyspace1"))
         .hasSize(1);
+  }
+
+  @Test
+  public void testParseSeedHost() {
+    String seedHostStringList = "127.0.0.1 , 127.0.0.2,  127.0.0.3";
+    Set<String> seedHostSet = ClusterResource.parseSeedHosts(seedHostStringList);
+    Set<String> seedHostExpectedSet = Sets.newHashSet("127.0.0.2", "127.0.0.1", "127.0.0.3");
+
+    assertEquals(seedHostSet, seedHostExpectedSet);
   }
 
   private MockObjects initMocks() throws ReaperException {

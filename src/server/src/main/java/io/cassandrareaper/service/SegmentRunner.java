@@ -23,7 +23,6 @@ import io.cassandrareaper.core.RepairSegment;
 import io.cassandrareaper.core.RepairUnit;
 import io.cassandrareaper.jmx.JmxProxy;
 import io.cassandrareaper.jmx.RepairStatusHandler;
-import io.cassandrareaper.resources.CommonTools;
 import io.cassandrareaper.storage.IDistributedStorage;
 
 import java.lang.management.ManagementFactory;
@@ -49,7 +48,6 @@ import javax.management.JMException;
 
 import com.codahale.metrics.MetricRegistry;
 import com.codahale.metrics.Timer;
-import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Maps;
@@ -67,11 +65,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 
-public final class SegmentRunner implements RepairStatusHandler, Runnable {
+final class SegmentRunner implements RepairStatusHandler, Runnable {
 
   // Caching all active SegmentRunners.
-  @VisibleForTesting
-  public static final Map<UUID, SegmentRunner> SEGMENT_RUNNERS = Maps.newConcurrentMap();
+  static final Map<UUID, SegmentRunner> SEGMENT_RUNNERS = Maps.newConcurrentMap();
 
   private static final Logger LOG = LoggerFactory.getLogger(SegmentRunner.class);
 
@@ -82,6 +79,8 @@ public final class SegmentRunner implements RepairStatusHandler, Runnable {
 
   private static final long SLEEP_TIME_AFTER_POSTPONE_IN_MS = 10000;
   private static final ExecutorService METRICS_GRABBER_EXECUTOR = Executors.newFixedThreadPool(10);
+  private static final long METRICS_POLL_INTERVAL_MS = TimeUnit.SECONDS.toMillis(10);
+  private static final long METRICS_MAX_WAIT_MS = TimeUnit.MINUTES.toMillis(2);
 
   private final AppContext context;
   private final UUID segmentId;
@@ -98,7 +97,7 @@ public final class SegmentRunner implements RepairStatusHandler, Runnable {
   private final UUID leaderElectionId;
 
 
-  public SegmentRunner(
+  SegmentRunner(
       AppContext context,
       UUID segmentId,
       Collection<String> potentialCoordinators,
@@ -165,7 +164,7 @@ public final class SegmentRunner implements RepairStatusHandler, Runnable {
     }
   }
 
-  public static void abort(AppContext context, RepairSegment segment, JmxProxy jmxConnection) {
+  static void abort(AppContext context, RepairSegment segment, JmxProxy jmxConnection) {
     postpone(context, segment, context.storage.getRepairUnit(segment.getRepairUnitId()));
     LOG.info("Aborting repair on segment with id {} on coordinator {}", segment.getId(), segment.getCoordinatorHost());
     String metric = MetricRegistry.name(SegmentRunner.class, "abort", segment.getCoordinatorHost());
@@ -180,7 +179,7 @@ public final class SegmentRunner implements RepairStatusHandler, Runnable {
   /**
    * Remember to call method postponeCurrentSegment() outside of synchronized(condition) block.
    */
-  public void postponeCurrentSegment() {
+  void postponeCurrentSegment() {
     synchronized (condition) {
       RepairSegment segment = context.storage.getRepairSegment(repairRunner.getRepairRunId(), segmentId).get();
       postpone(context, segment, context.storage.getRepairUnit(segment.getRepairUnitId()));
@@ -246,7 +245,7 @@ public final class SegmentRunner implements RepairStatusHandler, Runnable {
       try (Timer.Context cxt1 = context.metricRegistry.timer(metricNameForRepairing(segment)).time()) {
         Set<String> tablesToRepair;
         try {
-          tablesToRepair = CommonTools.getTablesToRepair(coordinator, repairUnit);
+          tablesToRepair = getTablesToRepair(coordinator, repairUnit);
         } catch (IllegalStateException e) {
           String msg = "Invalid blacklist definition. It filtered all tables in the keyspace.";
           LOG.error(msg, e);
@@ -410,8 +409,6 @@ public final class SegmentRunner implements RepairStatusHandler, Runnable {
       JmxProxy coordinator,
       LazyInitializer<Set<String>> busyHosts) {
 
-    Collection<String> allHosts;
-
     if (repairUnit.getIncrementalRepair()) {
       // In incremental repairs, only one segment is allowed at once (one segment == the full primary range of one node)
       if (repairHasSegmentRunning(segment.getRunId())) {
@@ -422,31 +419,30 @@ public final class SegmentRunner implements RepairStatusHandler, Runnable {
         declineRun();
         return false;
       }
-
       return true;
     }
+
+    Collection<String> nodes;
     try {
       // when hosts are coming up or going down, this method can throw an
       //  UndeclaredThrowableException
-      allHosts = coordinator.tokenRangeToEndpoint(keyspace, segment.getTokenRange());
+      nodes = coordinator.tokenRangeToEndpoint(keyspace, segment.getTokenRange());
     } catch (RuntimeException e) {
       LOG.warn("SegmentRunner couldn't get token ranges from coordinator: ", e);
       String msg = "SegmentRunner couldn't get token ranges from coordinator";
       repairRunner.updateLastEvent(msg);
       return false;
     }
-    String datacenter = coordinator.getDataCenter();
-    boolean gotMetricsForAllHostsInDc = true;
-    boolean gotMetricsForAllHosts = true;
-    Map<String, String> dcByHost = Maps.newHashMap();
-    allHosts.forEach(host -> dcByHost.put(host, coordinator.getDataCenter(host)));
+    String dc = coordinator.getDataCenter();
+    boolean allLocalDcHosts = true;
+    boolean allHosts = true;
+    Map<String, String> dcByNode = Maps.newHashMap();
+    nodes.forEach(node -> dcByNode.put(node, coordinator.getDataCenter(node)));
 
-    List<Callable<Pair<String, Optional<NodeMetrics>>>> getMetricsTasks = allHosts
-        .stream()
-        .filter(
-            host
-              -> repairUnit.getDatacenters().isEmpty() || repairUnit.getDatacenters().contains(dcByHost.get(host)))
-        .map(host -> getNodeMetrics(host, datacenter, dcByHost.get(host)))
+    List<Callable<Pair<String, Optional<NodeMetrics>>>> getMetricsTasks = nodes.stream()
+        .filter(node
+            -> repairUnit.getDatacenters().isEmpty() || repairUnit.getDatacenters().contains(dcByNode.get(node)))
+        .map(node -> getNodeMetrics(node, dc != null ? dc : "", dcByNode.get(node) != null ? dcByNode.get(node) : ""))
         .collect(Collectors.toList());
 
     try {
@@ -455,9 +451,9 @@ public final class SegmentRunner implements RepairStatusHandler, Runnable {
           Pair<String, Optional<NodeMetrics>> result = future.get();
           if (!result.getRight().isPresent()) {
             // We failed at getting metrics for that node
-            gotMetricsForAllHosts = false;
-            if (dcByHost.get(result.getLeft()).equals(datacenter)) {
-              gotMetricsForAllHostsInDc = false;
+            allHosts = false;
+            if (dcByNode.get(result.getLeft()).equals(dc)) {
+              allLocalDcHosts = false;
             }
           } else {
             NodeMetrics metrics = result.getRight().get();
@@ -466,9 +462,8 @@ public final class SegmentRunner implements RepairStatusHandler, Runnable {
               LOG.info(
                   "SegmentRunner declined to repair segment {} because of"
                       + " too many pending compactions (> {}) on host \"{}\"",
-                  segmentId,
-                  MAX_PENDING_COMPACTIONS,
-                  metrics.getHostAddress());
+                  segmentId, MAX_PENDING_COMPACTIONS, metrics.getNode());
+
               String msg = String.format("Postponed due to pending compactions (%d)", pendingCompactions);
               repairRunner.updateLastEvent(msg);
               return false;
@@ -476,27 +471,26 @@ public final class SegmentRunner implements RepairStatusHandler, Runnable {
             if (metrics.hasRepairRunning()) {
               LOG.info(
                   "SegmentRunner declined to repair segment {} because one of the hosts ({}) was "
-                  + "already involved in a repair",
-                  segmentId,
-                  metrics.getHostAddress());
+                    + "already involved in a repair",
+                  segmentId, metrics.getNode());
+
               String msg = "Postponed due to affected hosts already doing repairs";
               repairRunner.updateLastEvent(msg);
-              handlePotentialStuckRepairs(busyHosts, metrics.getHostAddress());
+              handlePotentialStuckRepairs(busyHosts, metrics.getNode());
               return false;
             }
           }
         } catch (InterruptedException | ExecutionException | ConcurrentException e) {
           LOG.warn("Failed grabbing metrics from at least one node. Cannot repair segment :'(", e);
-          gotMetricsForAllHostsInDc = false;
-          gotMetricsForAllHosts = false;
+          allLocalDcHosts = false;
+          allHosts = false;
         }
       }
     } catch (InterruptedException e) {
       LOG.debug("failed grabbing nodes metrics", e);
     }
 
-    if (okToRepairSegment(
-        gotMetricsForAllHostsInDc, gotMetricsForAllHosts, context.config.getDatacenterAvailability())) {
+    if (okToRepairSegment(allLocalDcHosts, allHosts, context.config.getDatacenterAvailability())) {
       LOG.info("It is ok to repair segment '{}' on repair run with id '{}'", segment.getId(), segment.getRunId());
       return true;
     } else {
@@ -508,75 +502,96 @@ public final class SegmentRunner implements RepairStatusHandler, Runnable {
     }
   }
 
-  @VisibleForTesting
-  public static boolean okToRepairSegment(
-      boolean allHostsInLocalDc,
-      boolean allHosts,
-      DatacenterAvailability dcAvailability) {
-
-    return allHosts || (allHostsInLocalDc && DatacenterAvailability.LOCAL.equals(dcAvailability));
+  static boolean okToRepairSegment(boolean allLocalDcHosts, boolean allHosts, DatacenterAvailability dcAvailability) {
+    return allHosts || (allLocalDcHosts && DatacenterAvailability.LOCAL == dcAvailability);
   }
 
   private void handlePotentialStuckRepairs(LazyInitializer<Set<String>> busyHosts, String hostName)
       throws ConcurrentException {
 
     if (!busyHosts.get().contains(hostName) && context.storage instanceof IDistributedStorage) {
-      LOG.warn(
-          "A host ({}) reported that it is involved in a repair, but there is no record "
-          + "of any ongoing repair involving the host. Sending command to abort all repairs "
-          + "on the host.",
-          hostName);
       try (JmxProxy hostProxy
           = context.jmxConnectionFactory.connect(hostName, context.config.getJmxConnectionTimeoutInSeconds())) {
-        hostProxy.cancelAllRepairs();
-        hostProxy.close();
-      } catch (ReaperException | RuntimeException | InterruptedException e) {
+        // We double check that repair is still running there before actually canceling repairs
+        if (hostProxy.isRepairRunning()) {
+          LOG.warn(
+              "A host ({}) reported that it is involved in a repair, but there is no record "
+                  + "of any ongoing repair involving the host. Sending command to abort all repairs "
+                  + "on the host.",
+              hostName);
+          hostProxy.cancelAllRepairs();
+          hostProxy.close();
+        }
+      } catch (ReaperException | RuntimeException | InterruptedException | JMException e) {
         LOG.debug("failed to cancel repairs on host {}", hostName, e);
       }
     }
   }
 
-  Callable<Pair<String, Optional<NodeMetrics>>> getNodeMetrics(
-      String hostName, String localDatacenter, String hostDatacenter) {
+  Callable<Pair<String, Optional<NodeMetrics>>> getNodeMetrics(String node, String localDc, String nodeDc) {
+
     return () -> {
-      LOG.debug("getMetricsForHost {} / {} / {}", hostName, localDatacenter, hostDatacenter);
-      try (JmxProxy hostProxy
-          = context.jmxConnectionFactory.connect(hostName, context.config.getJmxConnectionTimeoutInSeconds())) {
-        int pendingCompactions = hostProxy.getPendingCompactions();
-        boolean hasRepairRunning = hostProxy.isRepairRunning();
+      LOG.debug("getMetricsForHost {} / {} / {}", node, localDc, nodeDc);
+      try (JmxProxy nodeProxy
+          = context.jmxConnectionFactory.connect(node, context.config.getJmxConnectionTimeoutInSeconds())) {
 
         NodeMetrics metrics = NodeMetrics.builder()
-            .withHostAddress(hostName)
-            .withDatacenter(hostDatacenter)
-            .withPendingCompactions(pendingCompactions)
-            .withHasRepairRunning(hasRepairRunning)
+            .withNode(node)
+            .withDatacenter(nodeDc)
+            .withCluster(nodeProxy.getClusterName())
+            .withPendingCompactions(nodeProxy.getPendingCompactions())
+            .withHasRepairRunning(nodeProxy.isRepairRunning())
             .withActiveAnticompactions(0) // for future use
             .build();
 
-        storeNodeMetrics(metrics);
-        return Pair.of(hostName, Optional.of(metrics));
+        return Pair.of(node, Optional.of(metrics));
       } catch (RuntimeException | ReaperException e) {
-        LOG.debug("failed to query metrics for host {}, trying to get metrics from storage...", hostName, e);
-        if (!DatacenterAvailability.ALL.equals(context.config.getDatacenterAvailability())
-            && !hostDatacenter.equals(localDatacenter)) {
+        LOG.debug("failed to query metrics for host {}, trying to get metrics from storage...", node, e);
 
+        if (DatacenterAvailability.ALL != context.config.getDatacenterAvailability() && !nodeDc.equals(localDc)) {
           // We can get metrics for remote datacenters from storage
-          Optional<NodeMetrics> metrics = getNodeMetrics(hostName);
+          Optional<NodeMetrics> metrics = getRemoteNodeMetrics(node, nodeDc);
           if (metrics.isPresent()) {
-            return Pair.of(hostName, metrics);
+            return Pair.of(node, metrics);
           }
         }
-        return Pair.of(hostName, Optional.absent());
+        return Pair.of(node, Optional.absent());
       }
     };
   }
 
-  private Optional<NodeMetrics> getNodeMetrics(String hostName) {
-    Preconditions.checkState(!DatacenterAvailability.ALL.equals(context.config.getDatacenterAvailability()));
+  private Optional<NodeMetrics> getRemoteNodeMetrics(String node, String nodeDc) {
+    Preconditions.checkState(DatacenterAvailability.ALL != context.config.getDatacenterAvailability());
 
-    return context.storage instanceof IDistributedStorage
-        ? ((IDistributedStorage) context.storage).getNodeMetrics(hostName)
-        : Optional.absent();
+    Optional<NodeMetrics> result = Optional.absent();
+    if (context.storage instanceof IDistributedStorage) {
+      IDistributedStorage storage = ((IDistributedStorage) context.storage);
+      result = storage.getNodeMetrics(repairRunner.getRepairRunId(), node);
+
+      if (!result.isPresent() && DatacenterAvailability.EACH == context.config.getDatacenterAvailability()) {
+        // Sending a request for metrics to the other reaper instances through the Cassandra backend
+        storeNodeMetrics(
+            NodeMetrics.builder()
+                .withCluster(clusterName)
+                .withDatacenter(nodeDc)
+                .withNode(node)
+                .withRequested(true)
+                .build());
+
+        long start = System.currentTimeMillis();
+
+        while ( (!result.isPresent() || result.get().isRequested())
+            && start + METRICS_MAX_WAIT_MS > System.currentTimeMillis()) {
+
+          try {
+            Thread.sleep(METRICS_POLL_INTERVAL_MS);
+          } catch (InterruptedException ignore) { }
+          LOG.info("Trying to get metrics from remote DCs for {} in {} of {}", node, nodeDc, clusterName);
+          result = storage.getNodeMetrics(repairRunner.getRepairRunId(), node);
+        }
+      }
+    }
+    return result;
   }
 
   private boolean isRepairRunningOnOneNode(RepairSegment segment) {
@@ -611,10 +626,9 @@ public final class SegmentRunner implements RepairStatusHandler, Runnable {
   }
 
   private void storeNodeMetrics(NodeMetrics metrics) {
-    if (context.storage instanceof IDistributedStorage
-        && !DatacenterAvailability.ALL.equals(context.config.getDatacenterAvailability())) {
-
-      ((IDistributedStorage) context.storage).storeNodeMetrics(metrics);
+    assert context.storage instanceof IDistributedStorage;
+    if (DatacenterAvailability.ALL != context.config.getDatacenterAvailability()) {
+      ((IDistributedStorage) context.storage).storeNodeMetrics(repairRunner.getRepairRunId(), metrics);
     }
   }
 
@@ -829,8 +843,7 @@ public final class SegmentRunner implements RepairStatusHandler, Runnable {
   /**
    * Attempts to clear snapshots that are possibly left behind after failed repair sessions.
    */
-  @VisibleForTesting
-  protected void tryClearSnapshots(String message) {
+  void tryClearSnapshots(String message) {
     String keyspace = repairUnit.getKeyspaceName();
     String repairId = parseRepairId(message);
     if (repairId != null) {
@@ -852,7 +865,7 @@ public final class SegmentRunner implements RepairStatusHandler, Runnable {
     }
   }
 
-  public static String parseRepairId(String message) {
+  static String parseRepairId(String message) {
     Matcher uuidMatcher = REPAIR_UUID_PATTERN.matcher(message);
     if (uuidMatcher.find()) {
       return uuidMatcher.group();
@@ -934,4 +947,41 @@ public final class SegmentRunner implements RepairStatusHandler, Runnable {
         ? ((IDistributedStorage) context.storage).countRunningReapers()
         : 1;
   }
+
+  /**
+   * Applies blacklist filter on tables for the given repair unit.
+   *
+   * @param coordinator : a JMX proxy instance
+   * @param unit : the repair unit for the current run
+   * @return the list of tables to repair for the keyspace without the blacklisted ones
+   * @throws ReaperException, IllegalStateException
+   */
+  static Set<String> getTablesToRepair(JmxProxy coordinator, RepairUnit unit)
+      throws ReaperException, IllegalStateException {
+    Set<String> tables = unit.getColumnFamilies();
+
+    if (!unit.getBlacklistedTables().isEmpty() && unit.getColumnFamilies().isEmpty()) {
+      tables =
+          coordinator
+              .getTableNamesForKeyspace(unit.getKeyspaceName())
+              .stream()
+              .filter(tableName -> !unit.getBlacklistedTables().contains(tableName))
+              .collect(Collectors.toSet());
+    }
+
+    if (!unit.getBlacklistedTables().isEmpty() && !unit.getColumnFamilies().isEmpty()) {
+      tables =
+          unit.getColumnFamilies()
+              .stream()
+              .filter(tableName -> !unit.getBlacklistedTables().contains(tableName))
+              .collect(Collectors.toSet());
+    }
+
+    Preconditions.checkState(
+        !(!unit.getBlacklistedTables().isEmpty()
+            && tables.isEmpty())); // if we have a blacklist, we should have tables in the output.
+
+    return tables;
+  }
+
 }

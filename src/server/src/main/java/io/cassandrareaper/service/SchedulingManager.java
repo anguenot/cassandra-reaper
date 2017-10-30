@@ -19,7 +19,6 @@ import io.cassandrareaper.ReaperException;
 import io.cassandrareaper.core.RepairRun;
 import io.cassandrareaper.core.RepairSchedule;
 import io.cassandrareaper.core.RepairUnit;
-import io.cassandrareaper.resources.CommonTools;
 
 import java.util.Collection;
 import java.util.Timer;
@@ -40,6 +39,7 @@ public final class SchedulingManager extends TimerTask {
   private static volatile TimerTask SCHEDULING_MANAGER;
 
   private final AppContext context;
+  private final RepairRunService repairRunService;
 
   /* nextActivatedSchedule used for nicer logging only */
   private RepairSchedule nextActivatedSchedule;
@@ -47,6 +47,7 @@ public final class SchedulingManager extends TimerTask {
 
   private SchedulingManager(AppContext context) {
     this.context = context;
+    this.repairRunService = RepairRunService.create(context);
   }
 
   public static void start(AppContext context) {
@@ -164,7 +165,7 @@ public final class SchedulingManager extends TimerTask {
               //        .addRepairRunToRepairSchedule(schedule.getId(), newRepairRun.getId());
 
               if (result) {
-                context.repairManager.startRepairRun(context, newRepairRun);
+                context.repairManager.startRepairRun(newRepairRun);
                 return true;
               }
             } else if (schedule.getRunHistory().size() < latestSchedule.getRunHistory().size()) {
@@ -173,7 +174,7 @@ public final class SchedulingManager extends TimerTask {
               // this repair_run is identified as a duplicate (for this activation):
               // so take the last repair run, and try start it. it's ok if already running.
               newRepairRun = context.storage.getRepairRun(newRepairRunId).get();
-              context.repairManager.startRepairRun(context, newRepairRun);
+              context.repairManager.startRepairRun(newRepairRun);
             } else {
               LOG.warn("schedule {} has been altered by someone else. not running repair", schedule.getId());
             }
@@ -243,8 +244,7 @@ public final class SchedulingManager extends TimerTask {
 
   private RepairRun createNewRunForUnit(RepairSchedule schedule, RepairUnit repairUnit) throws ReaperException {
 
-    return CommonTools.registerRepairRun(
-        context,
+    return repairRunService.registerRepairRun(
         context.storage.getCluster(repairUnit.getClusterName()).get(),
         repairUnit,
         Optional.of(getCauseName(schedule)),

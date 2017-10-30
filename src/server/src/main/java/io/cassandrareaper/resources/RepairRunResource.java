@@ -22,6 +22,8 @@ import io.cassandrareaper.core.RepairRun.RunState;
 import io.cassandrareaper.core.RepairSegment;
 import io.cassandrareaper.core.RepairUnit;
 import io.cassandrareaper.resources.view.RepairRunStatus;
+import io.cassandrareaper.service.RepairRunService;
+import io.cassandrareaper.service.RepairUnitService;
 
 import java.net.MalformedURLException;
 import java.net.URI;
@@ -48,7 +50,6 @@ import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
 import javax.ws.rs.core.UriInfo;
 
-import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
@@ -66,9 +67,13 @@ public final class RepairRunResource {
   private static final Logger LOG = LoggerFactory.getLogger(RepairRunResource.class);
 
   private final AppContext context;
+  private final RepairUnitService repairUnitService;
+  private final RepairRunService repairRunService;
 
   public RepairRunResource(AppContext context) {
     this.context = context;
+    this.repairUnitService = RepairUnitService.create(context);
+    this.repairRunService = RepairRunService.create(context);
   }
 
   /**
@@ -148,7 +153,7 @@ public final class RepairRunResource {
       final Cluster cluster = context.storage.getCluster(Cluster.toSymbolicName(clusterName.get())).get();
       Set<String> tableNames;
       try {
-        tableNames = CommonTools.getTableNamesBasedOnParam(context, cluster, keyspace.get(), tableNamesParam);
+        tableNames = repairRunService.getTableNamesBasedOnParam(cluster, keyspace.get(), tableNamesParam);
       } catch (IllegalArgumentException ex) {
         LOG.error(ex.getMessage(), ex);
         return Response.status(Response.Status.NOT_FOUND).entity(ex.getMessage()).build();
@@ -156,9 +161,8 @@ public final class RepairRunResource {
 
       Set<String> blacklistedTableNames;
       try {
-        blacklistedTableNames =
-            CommonTools.getTableNamesBasedOnParam(
-                context, cluster, keyspace.get(), blacklistedTableNamesParam);
+        blacklistedTableNames
+            = repairRunService.getTableNamesBasedOnParam(cluster, keyspace.get(), blacklistedTableNamesParam);
       } catch (IllegalArgumentException ex) {
         LOG.error(ex.getMessage(), ex);
         return Response.status(Response.Status.NOT_FOUND).entity(ex.getMessage()).build();
@@ -166,7 +170,7 @@ public final class RepairRunResource {
 
       final Set<String> nodesToRepair;
       try {
-        nodesToRepair = CommonTools.getNodesToRepairBasedOnParam(context, cluster, nodesToRepairParam);
+        nodesToRepair = repairRunService.getNodesToRepairBasedOnParam(cluster, nodesToRepairParam);
       } catch (IllegalArgumentException ex) {
         LOG.error(ex.getMessage(), ex);
         return Response.status(Response.Status.NOT_FOUND).entity(ex.getMessage()).build();
@@ -174,8 +178,8 @@ public final class RepairRunResource {
 
       final Set<String> datacentersToRepair;
       try {
-        datacentersToRepair = CommonTools
-            .getDatacentersToRepairBasedOnParam(context, cluster, datacentersToRepairParam);
+        datacentersToRepair = RepairRunService
+            .getDatacentersToRepairBasedOnParam(cluster, datacentersToRepairParam);
 
       } catch (IllegalArgumentException ex) {
         LOG.error(ex.getMessage(), ex);
@@ -183,8 +187,7 @@ public final class RepairRunResource {
       }
 
       final RepairUnit theRepairUnit =
-          CommonTools.getNewOrExistingRepairUnit(
-              context,
+          repairUnitService.getNewOrExistingRepairUnit(
               cluster,
               keyspace.get(),
               tableNames,
@@ -219,8 +222,7 @@ public final class RepairRunResource {
       }
 
       final RepairRun newRepairRun =
-          CommonTools.registerRepairRun(
-              context,
+          repairRunService.registerRepairRun(
               cluster,
               theRepairUnit,
               cause,
@@ -244,7 +246,7 @@ public final class RepairRunResource {
    * @return Response instance in case there is a problem, or null if everything is ok.
    */
   @Nullable
-  public static Response checkRequestForAddRepair(
+  static Response checkRequestForAddRepair(
       AppContext context,
       Optional<String> clusterName,
       Optional<String> keyspace,
@@ -400,29 +402,29 @@ public final class RepairRunResource {
     }
   }
 
-  private boolean isStarting(RepairRun.RunState oldState, RepairRun.RunState newState) {
+  private static boolean isStarting(RepairRun.RunState oldState, RepairRun.RunState newState) {
     return oldState == RepairRun.RunState.NOT_STARTED && newState == RepairRun.RunState.RUNNING;
   }
 
-  private boolean isPausing(RepairRun.RunState oldState, RepairRun.RunState newState) {
+  private static boolean isPausing(RepairRun.RunState oldState, RepairRun.RunState newState) {
     return oldState == RepairRun.RunState.RUNNING && newState == RepairRun.RunState.PAUSED;
   }
 
-  private boolean isResuming(RepairRun.RunState oldState, RepairRun.RunState newState) {
+  private static boolean isResuming(RepairRun.RunState oldState, RepairRun.RunState newState) {
     return oldState == RepairRun.RunState.PAUSED && newState == RepairRun.RunState.RUNNING;
   }
 
-  private boolean isRetrying(RepairRun.RunState oldState, RepairRun.RunState newState) {
+  private static boolean isRetrying(RepairRun.RunState oldState, RepairRun.RunState newState) {
     return oldState == RepairRun.RunState.ERROR && newState == RepairRun.RunState.RUNNING;
   }
 
-  private boolean isAborting(RepairRun.RunState oldState, RepairRun.RunState newState) {
+  private static boolean isAborting(RepairRun.RunState oldState, RepairRun.RunState newState) {
     return oldState != RepairRun.RunState.ERROR && newState == RepairRun.RunState.ABORTED;
   }
 
   private Response startRun(RepairRun repairRun, RepairUnit repairUnit, int segmentsRepaired) throws ReaperException {
     LOG.info("Starting run {}", repairRun.getId());
-    final RepairRun newRun = context.repairManager.startRepairRun(context, repairRun);
+    final RepairRun newRun = context.repairManager.startRepairRun(repairRun);
     return Response.status(Response.Status.OK)
         .entity(new RepairRunStatus(newRun, repairUnit, segmentsRepaired))
         .build();
@@ -430,19 +432,19 @@ public final class RepairRunResource {
 
   private Response pauseRun(RepairRun repairRun, RepairUnit repairUnit, int segmentsRepaired) throws ReaperException {
     LOG.info("Pausing run {}", repairRun.getId());
-    final RepairRun newRun = context.repairManager.pauseRepairRun(context, repairRun);
+    final RepairRun newRun = context.repairManager.pauseRepairRun(repairRun);
     return Response.ok().entity(new RepairRunStatus(newRun, repairUnit, segmentsRepaired)).build();
   }
 
   private Response resumeRun(RepairRun repairRun, RepairUnit repairUnit, int segmentsRepaired) throws ReaperException {
     LOG.info("Resuming run {}", repairRun.getId());
-    final RepairRun newRun = context.repairManager.startRepairRun(context, repairRun);
+    final RepairRun newRun = context.repairManager.startRepairRun(repairRun);
     return Response.ok().entity(new RepairRunStatus(newRun, repairUnit, segmentsRepaired)).build();
   }
 
   private Response abortRun(RepairRun repairRun, RepairUnit repairUnit, int segmentsRepaired) throws ReaperException {
     LOG.info("Aborting run {}", repairRun.getId());
-    final RepairRun newRun = context.repairManager.abortRepairRun(context, repairRun);
+    final RepairRun newRun = context.repairManager.abortRepairRun(repairRun);
     return Response.ok().entity(new RepairRunStatus(newRun, repairUnit, segmentsRepaired)).build();
   }
 
@@ -566,10 +568,9 @@ public final class RepairRunResource {
     return runStatuses;
   }
 
-  @VisibleForTesting
-  public Set splitStateParam(Optional<String> state) {
+  static Set splitStateParam(Optional<String> state) {
     if (state.isPresent()) {
-      final Iterable<String> chunks = CommonTools.COMMA_SEPARATED_LIST_SPLITTER.split(state.get());
+      final Iterable<String> chunks = RepairRunService.COMMA_SEPARATED_LIST_SPLITTER.split(state.get());
       for (final String chunk : chunks) {
         try {
           RepairRun.RunState.valueOf(chunk.toUpperCase());

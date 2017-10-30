@@ -19,7 +19,6 @@ import io.cassandrareaper.ReaperException;
 import java.math.BigInteger;
 import java.util.List;
 
-import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Lists;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -27,7 +26,7 @@ import org.slf4j.LoggerFactory;
 /**
  * Splits given Cassandra table's token range into RepairSegments.
  */
-public final class SegmentGenerator {
+final class SegmentGenerator {
 
   private static final Logger LOG = LoggerFactory.getLogger(SegmentGenerator.class);
 
@@ -36,7 +35,7 @@ public final class SegmentGenerator {
   private final BigInteger rangeMax;
   private final BigInteger rangeSize;
 
-  public SegmentGenerator(String partitioner) throws ReaperException {
+  SegmentGenerator(String partitioner) throws ReaperException {
     if (partitioner.endsWith("RandomPartitioner")) {
       rangeMin = BigInteger.ZERO;
       rangeMax = new BigInteger("2").pow(127).subtract(BigInteger.ONE);
@@ -50,40 +49,34 @@ public final class SegmentGenerator {
     this.partitioner = partitioner;
   }
 
-  public SegmentGenerator(BigInteger rangeMin, BigInteger rangeMax) {
+  SegmentGenerator(BigInteger rangeMin, BigInteger rangeMax) {
     this.rangeMin = rangeMin;
     this.rangeMax = rangeMax;
     rangeSize = rangeMax.subtract(rangeMin).add(BigInteger.ONE);
     partitioner = "(" + rangeMin + "," + rangeMax + ")";
   }
 
-  @VisibleForTesting
-  public static BigInteger max(BigInteger big0, BigInteger big1) {
+  static BigInteger max(BigInteger big0, BigInteger big1) {
     return greaterThan(big0, big1) ? big0 : big1;
   }
 
-  @VisibleForTesting
-  public static BigInteger min(BigInteger big0, BigInteger big1) {
+  static BigInteger min(BigInteger big0, BigInteger big1) {
     return lowerThan(big0, big1) ? big0 : big1;
   }
 
-  @VisibleForTesting
-  public static boolean lowerThan(BigInteger big0, BigInteger big1) {
+  static boolean lowerThan(BigInteger big0, BigInteger big1) {
     return big0.compareTo(big1) < 0;
   }
 
-  @VisibleForTesting
-  public static boolean lowerThanOrEqual(BigInteger big0, BigInteger big1) {
+  static boolean lowerThanOrEqual(BigInteger big0, BigInteger big1) {
     return big0.compareTo(big1) <= 0;
   }
 
-  @VisibleForTesting
-  public static boolean greaterThan(BigInteger big0, BigInteger big1) {
+  static boolean greaterThan(BigInteger big0, BigInteger big1) {
     return big0.compareTo(big1) > 0;
   }
 
-  @VisibleForTesting
-  public static boolean greaterThanOrEqual(BigInteger big0, BigInteger big1) {
+  static boolean greaterThanOrEqual(BigInteger big0, BigInteger big1) {
     return big0.compareTo(big1) >= 0;
   }
 
@@ -94,7 +87,7 @@ public final class SegmentGenerator {
    * @param ringTokens list of all start tokens in big0 cluster. They have to be in ring order.
    * @return big0 list containing at least {@code totalSegmentCount} repair segments.
    */
-  public List<RingRange> generateSegments(int totalSegmentCount, List<BigInteger> ringTokens, Boolean incrementalRepair)
+  List<RingRange> generateSegments(int totalSegmentCount, List<BigInteger> ringTokens, Boolean incrementalRepair)
       throws ReaperException {
 
     int tokenRangeCount = ringTokens.size();

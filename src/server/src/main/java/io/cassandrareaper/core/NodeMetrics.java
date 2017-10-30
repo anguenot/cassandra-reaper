@@ -14,39 +14,60 @@
 
 package io.cassandrareaper.core;
 
+import com.google.common.base.Preconditions;
+
 public final class NodeMetrics {
 
-  private final String hostAddress;
+  private final String node;
+  private final String cluster;
   private final String datacenter;
+  private final boolean requested;
   private final int pendingCompactions;
   private final boolean hasRepairRunning;
   private final int activeAnticompactions;
 
   private NodeMetrics(Builder builder) {
-    this.hostAddress = builder.hostAddress;
+    this.node = builder.node;
+    this.cluster = builder.cluster;
     this.datacenter = builder.datacenter;
+    this.requested = builder.requested;
     this.pendingCompactions = builder.pendingCompactions;
     this.hasRepairRunning = builder.hasRepairRunning;
     this.activeAnticompactions = builder.activeAnticompactions;
   }
 
-  public String getHostAddress() {
-    return hostAddress;
+  public String getNode() {
+    return node;
+  }
+
+  public String getCluster() {
+    return cluster;
   }
 
   public String getDatacenter() {
     return datacenter;
   }
 
+  /** If true indicates that metrics for this node have been requested.
+   *<p/>
+   * A reaper instance that can jmx access the node will do so on its next heartbeat.
+   */
+  public boolean isRequested() {
+    return requested;
+  }
+
   public int getPendingCompactions() {
+    Preconditions.checkState(!requested, "cant get metrics on requested NodeMetrics instance");
     return pendingCompactions;
   }
 
   public boolean hasRepairRunning() {
+    Preconditions.checkState(!requested, "cant get metrics on requested NodeMetrics instance");
     return hasRepairRunning;
   }
 
   public int getActiveAnticompactions() {
+    Preconditions.checkState(!requested, "cant get metrics on requested NodeMetrics instance" );
     return activeAnticompactions;
   }
 
@@ -64,22 +85,34 @@ public final class NodeMetrics {
    */
   public static final class Builder {
 
-    private String hostAddress;
+    private String node;
+    private String cluster;
     private String datacenter;
-    private int pendingCompactions;
-    private boolean hasRepairRunning;
-    private int activeAnticompactions;
+    private boolean requested = false;
+    private int pendingCompactions = 0;
+    private boolean hasRepairRunning = false;
+    private int activeAnticompactions = 0;
 
     private Builder() {
     }
 
-    public Builder withHostAddress(String hostAddress) {
-      this.hostAddress = hostAddress;
+    public Builder withNode(String node) {
+      this.node = node;
+      return this;
+    }
+
+    public Builder withCluster(String cluster) {
+      this.cluster = cluster;
       return this;
     }
 
     public Builder withDatacenter(String datacenter) {
       this.datacenter = datacenter;
+      return this;
+    }
+
+    public Builder withRequested(boolean requested) {
+      this.requested = requested;
       return this;
     }
 
@@ -99,6 +132,14 @@ public final class NodeMetrics {
     }
 
     public NodeMetrics build() {
+      Preconditions.checkNotNull(node, "node must be set");
+      Preconditions.checkNotNull(cluster, "cluster must be set");
+      Preconditions.checkNotNull(datacenter, "datacenter must be set");
+      if (requested) {
+        Preconditions.checkState(0 == pendingCompactions, "cant set metrics on requested NodeMetrics instance");
+        Preconditions.checkState(!hasRepairRunning, "cant set metrics on requested NodeMetrics instance");
+        Preconditions.checkState(0 == activeAnticompactions, "cant set metrics on requested NodeMetrics instance");
+      }
       return new NodeMetrics(this);
     }
   }
